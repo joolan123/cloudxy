@@ -57,7 +57,7 @@ function writeConfig() {
       levels: {
         "0": {
           handshake: 4,
-          connIdle: 90,
+          connIdle: 300,
           uplinkOnly: 2,
           downlinkOnly: 2,
           bufferSize: 512,
@@ -80,7 +80,10 @@ function writeConfig() {
         streamSettings: {
           network: GW_NET,
           security: "none",
-          wsSettings: { path: GW_PATH },
+          wsSettings: {
+            path: GW_PATH,
+            heartbeatPeriod: 25,
+          },
         },
       },
     ],
@@ -88,7 +91,7 @@ function writeConfig() {
       {
         protocol: "freedom",
         tag: "direct",
-        settings: { domainStrategy: "AsIs" },
+        settings: { domainStrategy: "UseIPv4" },
       },
     ],
   };
@@ -113,18 +116,28 @@ function startDaemon() {
   });
 }
 
-// 1. Bind PORT immediately so Cloudzyro health checks pass
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end('{"status":"ok"}');
 });
+
+server.timeout = 0;
+server.keepAliveTimeout = 0;
 
 server.on("upgrade", (req, socket, head) => {
   if (!req.url || !req.url.startsWith(GW_PATH)) {
     socket.destroy();
     return;
   }
+  socket.setTimeout(0);
+  socket.setNoDelay(true);
+  socket.setKeepAlive(true, 15000);
+
   const upstream = net.connect(INTERNAL_PORT, "127.0.0.1", () => {
+    upstream.setTimeout(0);
+    upstream.setNoDelay(true);
+    upstream.setKeepAlive(true, 15000);
+
     let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
     for (let i = 0; i < req.rawHeaders.length; i += 2) {
       raw += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
@@ -135,13 +148,13 @@ server.on("upgrade", (req, socket, head) => {
     socket.pipe(upstream);
     upstream.pipe(socket);
   });
+
   upstream.on("error", () => socket.destroy());
   socket.on("error", () => upstream.destroy());
 });
 
 server.listen(PORT, "0.0.0.0");
 
-// 2. Sync and launch background daemon asynchronously
 (async () => {
   try {
     fs.mkdirSync(R_DIR, { recursive: true });
