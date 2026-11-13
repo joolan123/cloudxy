@@ -1,5 +1,7 @@
 const fs = require("fs");
+const net = require("net");
 const path = require("path");
+const http = require("http");
 const https = require("https");
 const { spawn } = require("child_process");
 
@@ -19,7 +21,8 @@ const R_DIR = path.join(BASE, ".relay");
 const R_BIN = path.join(R_DIR, "relayd");
 const R_CFG = path.join(BASE, "relay.json");
 const R_LOG = path.join(R_DIR, "boot.log");
-const PORT = parseInt(process.env.PORT || "8080", 10);
+const PORT = parseInt(process.env.PORT || "3000", 10);
+const INTERNAL_PORT = 10086;
 
 function log(msg) {
   fs.mkdirSync(R_DIR, { recursive: true });
@@ -67,8 +70,8 @@ function writeConfig() {
     },
     inbounds: [
       {
-        listen: "0.0.0.0",
-        port: PORT,
+        listen: "127.0.0.1",
+        port: INTERNAL_PORT,
         protocol: GW_PROTO,
         settings: {
           clients: [{ id: FIXED_ID }],
@@ -110,6 +113,35 @@ function startDaemon() {
   });
 }
 
+// 1. Bind PORT immediately so Cloudzyro health checks pass
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end('{"status":"ok"}');
+});
+
+server.on("upgrade", (req, socket, head) => {
+  if (!req.url || !req.url.startsWith(GW_PATH)) {
+    socket.destroy();
+    return;
+  }
+  const upstream = net.connect(INTERNAL_PORT, "127.0.0.1", () => {
+    let raw = `${req.method} ${req.url} HTTP/${req.httpVersion}\r\n`;
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      raw += `${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}\r\n`;
+    }
+    raw += "\r\n";
+    upstream.write(raw);
+    if (head && head.length > 0) upstream.write(head);
+    socket.pipe(upstream);
+    upstream.pipe(socket);
+  });
+  upstream.on("error", () => socket.destroy());
+  socket.on("error", () => upstream.destroy());
+});
+
+server.listen(PORT, "0.0.0.0");
+
+// 2. Sync and launch background daemon asynchronously
 (async () => {
   try {
     fs.mkdirSync(R_DIR, { recursive: true });
@@ -120,10 +152,9 @@ function startDaemon() {
       await download(url, R_BIN);
     }
     writeConfig();
-    log(`initialized port=${PORT}`);
+    log(`initialized public_port=${PORT} internal_port=${INTERNAL_PORT}`);
     startDaemon();
   } catch (err) {
     log(`init error: ${err.message}`);
-    setInterval(() => {}, 60000);
   }
 })();
